@@ -7,12 +7,12 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { StatusModal, type StatusModalType } from '@/components/StatusModal'
-import { Archivos, AvisoProveedor, Encabezado, EstadoBadge, NavCfdi } from '@/components/Comun'
+import { Archivos, AvisoProveedor, CancelacionInfo, Encabezado, EstadoBadge, NavCfdi, urlEmitido } from '@/components/Comun'
 import { cn } from '@/lib/utils'
 import { inputCls, labelCls, useTheme } from '@/lib/ui'
 import {
-  cancelarCfdi, coincide, ESTADO_LABEL, formatFecha, formatMoney, getCfdi, getCfdis, getEstatus, getProveedor, MOTIVOS, serieFolio, TIPO_LABEL, validarCancelacion,
-  type Cfdi, type Estado, type Proveedor,
+  cancelarCfdi, coincide, ESTADO_LABEL, formatFecha, formatMoney, FUENTE_TC_LABEL, getCancelable, getCfdi, getCfdis, getEstatus, getProveedor, MOTIVOS, serieFolio, TIPO_LABEL, UUID_RE, validarCancelacion,
+  type Cancelable, type Cfdi, type Estado, type Proveedor,
 } from '@/lib/cfdi'
 
 type Modal = { isOpen: boolean; type: StatusModalType; title: string; message: string }
@@ -79,13 +79,26 @@ function App() {
   const [entiendo, setEntiendo] = useState(false)
   const errorCancel = validarCancelacion(motivo, sustituto)
   const abrirCancelar = () => { setMotivo('02'); setSustituto(''); setEntiendo(false); setCancelOpen(true) }
+  // Antes de cancelar se pregunta si se puede (p. ej. una PPD con complementos vigentes no).
+  const [revision, setRevision] = useState<{ data: Cancelable | null; loading: boolean; error: string }>({ data: null, loading: false, error: '' })
+  const sustitutoValido = motivo === '01' && UUID_RE.test(sustituto.trim()) ? sustituto.trim() : ''
+  useEffect(() => {
+    if (!cancelOpen || !org || !sel.c) return
+    let vivo = true
+    setRevision({ data: null, loading: true, error: '' })
+    getCancelable(org, sel.c.id, motivo, sustitutoValido)
+      .then(d => { if (vivo) setRevision({ data: d, loading: false, error: '' }) })
+      .catch(e => { if (vivo) setRevision({ data: null, loading: false, error: e instanceof Error ? e.message : 'No se pudo revisar la cancelación.' }) })
+    return () => { vivo = false }
+  }, [cancelOpen, motivo, sustitutoValido]) // eslint-disable-line react-hooks/exhaustive-deps
   const cancelar = async () => {
-    if (!org || !sel.c || errorCancel || !entiendo || busy) return
+    if (!org || !sel.c || errorCancel || !entiendo || busy || !revision.data?.puede) return
     setBusy('cancelar')
     try {
       const r = await cancelarCfdi(org, sel.c.id, motivo, sustituto.trim())
       setCancelOpen(false)
       if (r.en_proceso) setModal({ isOpen: true, type: 'info', title: 'Cancelación en curso', message: r.mensaje || 'El servicio sigue procesando la cancelación. Consulta el estatus en unos minutos.' })
+      else if ((r as { repetido?: boolean }).repetido) toast.info(r.mensaje || 'La cancelación ya estaba solicitada.')
       else toast.success('Cancelación solicitada.')
       await cargar(sel.c.id); void load()
     } catch (e) {
@@ -165,8 +178,15 @@ function App() {
                       <div key={l} className="min-w-0"><dt className="text-[10px] text-slate-500">{l}</dt><dd className="truncate">{v || '—'}</dd></div>
                     ))}
                   </dl>
-                  {c.motivo_cancelacion && <p className="text-xs text-slate-600">Cancelación solicitada {formatFecha(c.cancelacion_solicitada_en)} · motivo {c.motivo_cancelacion}{c.sustituto ? ` · sustituto ${c.sustituto}` : ''}</p>}
-                  {c.estado === 'cancelacion_en_proceso' && <p className="text-xs rounded-lg border border-amber-200 bg-amber-50 p-2 text-amber-900">Esperando que el receptor acepte la cancelación (hasta 3 días hábiles). Mientras tanto el CFDI sigue vigente.{c.prueba ? ' En modo prueba nunca se resuelve.' : ''}</p>}
+                  {c.cancelacion ? <CancelacionInfo c={c.cancelacion} /> : c.motivo_cancelacion && <p className="text-xs text-slate-600">Cancelación solicitada {formatFecha(c.cancelacion_solicitada_en)} · motivo {c.motivo_cancelacion}{c.sustituto ? ` · sustituto ${c.sustituto}` : ''}</p>}
+                  {c.moneda_factura && (c.conversion || c.tipo_cambio_fuente) && (
+                    <p className="text-xs text-slate-600">
+                      {c.conversion ? <>Factura en Books: {formatMoney(c.total_factura, c.moneda_factura)}, timbrada en {c.moneda} </> : null}
+                      Tipo de cambio {c.tipo_cambio ?? '—'}{c.tipo_cambio_fuente ? ` (${FUENTE_TC_LABEL[c.tipo_cambio_fuente] ?? c.tipo_cambio_fuente})` : ''}
+                      {c.tipo_cambio_fix ? ` · FIX ${c.tipo_cambio_fix} (${formatFecha(c.tipo_cambio_fix_fecha)})` : ''}{c.tipo_cambio_confirmado ? ' · confirmado a mano' : ''}
+                    </p>
+                  )}
+                  {!!c.advertencias?.length && <ul className="text-xs rounded-lg border border-amber-200 bg-amber-50 p-2 text-amber-900 list-disc pl-6">{c.advertencias.map(a => <li key={a}>{a}</li>)}</ul>}
                   {c.error && <p role="alert" className="text-xs text-red-700">{c.error}</p>}
                   {!!c.impuestos?.length && <p className="text-xs text-slate-600">Impuestos: {c.impuestos.map(i => `IVA ${Math.round(i.tasa * 100)}% sobre ${formatMoney(i.base)} = ${formatMoney(i.importe)}`).join(' · ')}</p>}
                   {!!c.monto_excluido && <p className="text-xs text-slate-500">Fuera del CFDI (reembolsos): {formatMoney(c.monto_excluido, c.moneda)}</p>}
@@ -218,9 +238,20 @@ function App() {
             <label className="flex items-start gap-2 text-xs text-slate-700"><input type="checkbox" className="mt-0.5" checked={entiendo} onChange={e => setEntiendo(e.target.checked)} />
               Entiendo que la cancelación no se puede deshacer.{c?.prueba ? ' (Modo prueba: no llega al SAT.)' : ''}</label>
             {errorCancel && motivo === '01' && sustituto && <p role="alert" className="text-xs text-red-700">{errorCancel}</p>}
+            {revision.loading && <p role="status" className="text-xs text-slate-500 flex items-center gap-1.5"><Loader2 className="w-3.5 h-3.5 animate-spin" />Revisando si se puede cancelar…</p>}
+            {revision.error && <p role="alert" className="text-xs text-red-700">{revision.error}</p>}
+            {revision.data && !revision.data.puede && (
+              <div role="alert" className="rounded-lg border border-red-200 bg-red-50 p-2 text-xs text-red-700 space-y-1">
+                <ul className="list-disc pl-5">{revision.data.bloqueantes.map(b => <li key={b}>{b}</li>)}</ul>
+                {!!revision.data.complementos_vigentes.length && (
+                  <p>Cancela primero: {revision.data.complementos_vigentes.map(x => <a key={x.cfdi_id} href={urlEmitido({ id: x.cfdi_id })} className="underline mr-2">{x.serie}-{x.folio} ({ESTADO_LABEL[x.estado] ?? x.estado})</a>)}</p>
+                )}
+              </div>
+            )}
+            {!!revision.data?.avisos.length && <ul className="rounded-lg border border-amber-200 bg-amber-50 p-2 text-[11px] text-amber-900 list-disc pl-5">{revision.data.avisos.map(a => <li key={a}>{a}</li>)}</ul>}
             <div className="flex justify-end gap-2">
               <Button variant="outline" className="h-10 border-slate-200" disabled={!!busy} onClick={() => setCancelOpen(false)}>No cancelar</Button>
-              <Button className="h-10 gap-1.5 bg-red-600 hover:bg-red-700 text-white" disabled={!!errorCancel || !entiendo || !!busy} onClick={() => void cancelar()}>
+              <Button className="h-10 gap-1.5 bg-red-600 hover:bg-red-700 text-white" disabled={!!errorCancel || !entiendo || !!busy || !revision.data?.puede} onClick={() => void cancelar()}>
                 {busy === 'cancelar' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Ban className="w-4 h-4" />}Cancelar CFDI
               </Button>
             </div>
